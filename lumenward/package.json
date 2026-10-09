@@ -1,0 +1,35 @@
+{
+  "name": "lumenward",
+  "version": "0.1.0",
+  "description": "Self-hosted SEP-30 account recovery server for Stellar, with a recovery-set auditor.",
+  "license": "MIT",
+  "type": "module",
+  "private": false,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "bin": {
+    "lumenward-audit": "dist/cli/audit.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "keygen": "node -e \"console.log(require('node:crypto').randomBytes(32).toString('base64'))\"",
+    "audit": "tsx src/cli/audit.ts",
+    "token": "tsx src/dev/issue-token.ts"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^17.2.1",
+    "fastify": "^5.12.5",
+    "jose": "^6.2.12"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}

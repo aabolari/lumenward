@@ -1,0 +1,298 @@
+[
+  {
+    "title": "feat(security): add rate limiting and lockout for failed authentication",
+    "complexity": "medium",
+    "area": "security",
+    "description": "Anyone can send unlimited requests, including guesses against identities. Add rate limiting so brute force attacks are slow and visible.",
+    "requirements": [
+      "Limit requests per IP and, for authenticated routes, per account address",
+      "Count failed token checks separately and apply a stricter limit",
+      "Return `429` with a JSON `{ \"error\": ... }` body and a `Retry-After` header",
+      "Limits are configurable by environment variables with safe defaults, and documented in `.env.example`",
+      "`/healthz` is never limited"
+    ],
+    "execution": "Look at the `@fastify/rate-limit` plugin and wire it in `src/api/server.ts`. Keep the limiter behind a small interface so a shared store (for example Redis) can be added later.",
+    "tests": "Add tests in `test/api.test.ts` for the limit being hit, the header, and `/healthz` staying open. Commit: `feat(security): add rate limiting`."
+  },
+  {
+    "title": "feat(store): add a PostgreSQL account store",
+    "complexity": "high",
+    "area": "storage",
+    "description": "SQLite is fine for one server but not for teams that need a managed database. Add a Postgres implementation of `AccountStore`.",
+    "requirements": [
+      "Implement `PostgresStore` in `src/store/postgres.ts` against the `AccountStore` interface",
+      "Add a migration for the `accounts` and `identity_methods` tables (same shape as `SqliteStore`)",
+      "`STORE=postgres` and `DATABASE_URL` select it in `src/config.ts` and `src/index.ts`",
+      "Concurrent `create` calls for the same address must produce exactly one success and one `AccountExistsError`",
+      "`listAccessible` must use an index and respect the `after` cursor and `limit`"
+    ],
+    "execution": "Use the `pg` package. Reuse `methodKey` from `src/store/access.ts` so lookups match the other stores.",
+    "tests": "Add `PostgresStore` to the factories in `test/store.test.ts` so it must pass the same contract tests. Skip it cleanly when no database is available. Commit: `feat(store): add postgres store`."
+  },
+  {
+    "title": "feat(keys): add a CLI to rotate signing keys",
+    "complexity": "high",
+    "area": "keys",
+    "description": "`AccountService.rotateSigningKey` exists but nothing calls it. Operators need a command to rotate keys on a schedule.",
+    "requirements": [
+      "Add `npm run rotate -- --older-than 90d [--dry-run]`",
+      "For each account whose newest key is older than the limit, add a new key and keep the old keys",
+      "Print how many accounts were rotated and never print secrets",
+      "Safe to run twice: accounts already rotated are skipped",
+      "Document the command and why old keys are kept (wallets may not have switched yet)"
+    ],
+    "execution": "Add `src/cli/rotate.ts` using `loadConfig`, the store and `AccountService`. You may need a `listAll` or an iterator on `AccountStore`; add it to every store.",
+    "tests": "Test with the memory store: old key rotated, new key skipped, dry run changes nothing. Commit: `feat(keys): add rotation cli`."
+  },
+  {
+    "title": "feat(keys): support KMS envelope encryption through a pluggable interface",
+    "complexity": "high",
+    "area": "keys",
+    "description": "Today one `KEY_ENCRYPTION_KEY` from the environment encrypts every signing key. Operators with a cloud KMS or Vault want the master key to stay outside the process.",
+    "requirements": [
+      "Introduce a `KeyEncryptor` interface (encrypt and decrypt of a data key) and make `KeyStore` use it",
+      "Keep the current local-key behaviour as the default implementation, with no change to stored data",
+      "Add one reference implementation for a KMS of your choice, behind an optional dependency",
+      "Store the wrapped data key with each record using a new format version (`v2`), and still read `v1`",
+      "Document the threat model: what this protects against and what it does not"
+    ],
+    "execution": "Start with the interface and a refactor that keeps all current tests green, then add the KMS implementation in a separate commit.",
+    "tests": "Existing `test/keystore.test.ts` must pass unchanged. Add tests for `v1` to `v2` reading and for a failing KMS. Commit: `feat(keys): add key encryptor interface`."
+  },
+  {
+    "title": "feat(auth): add an email one-time-code identity provider",
+    "complexity": "medium",
+    "area": "auth",
+    "description": "SEP-30 servers accept tokens from an identity provider the operator trusts. Lumenward verifies them but ships no provider. Add a small reference provider for email codes.",
+    "requirements": [
+      "A separate small service under `providers/email-otp` with `POST /start` (send a code) and `POST /verify` (return a signed JWT)",
+      "The JWT carries the OpenID Connect claims `email` and `email_verified: true` and is signed with an asymmetric key",
+      "Codes expire in 10 minutes, are single use, and are rate limited",
+      "Email sending goes through an interface with a console implementation for development",
+      "README section showing how to point `EXTERNAL_JWKS` at it"
+    ],
+    "execution": "Reuse `jose` for signing. Do not store codes in plain text.",
+    "tests": "Tests for expiry, single use, wrong code, and a token that Lumenward's `externalPrincipal` accepts. Commit: `feat(auth): add email otp provider`."
+  },
+  {
+    "title": "feat(auth): add an SMS one-time-code identity provider with a pluggable gateway",
+    "complexity": "medium",
+    "area": "auth",
+    "description": "Many users have a phone number but no email. Add a reference provider that issues tokens with a verified `phone_number`.",
+    "requirements": [
+      "A service under `providers/sms-otp` with the same start and verify flow as the email provider",
+      "Phone numbers are validated as E.164, matching `src/service/validation.ts`",
+      "The SMS gateway is an interface. Ship a console implementation and one real gateway example",
+      "Limit attempts per number and per IP",
+      "The token carries `phone_number` and `phone_number_verified: true`"
+    ],
+    "execution": "Share the code and token logic with the email provider instead of copying it. Consider a small shared package.",
+    "tests": "Tests for invalid numbers, expiry, attempt limits, and acceptance by `externalPrincipal`. Commit: `feat(auth): add sms otp provider`."
+  },
+  {
+    "title": "feat(ops): add an append-only audit log",
+    "complexity": "high",
+    "area": "operations",
+    "description": "Operators need to know who registered, changed, deleted or asked for a signature, and when. Today nothing is recorded.",
+    "requirements": [
+      "Record register, update, delete, list and sign events with time, account address, which identity matched, and the result",
+      "Never record tokens, secrets, signatures or full transactions. Record the transaction hash only",
+      "Store events in a table that the service can only append to",
+      "Add `npm run audit-log -- --since 2026-01-01` to export events as JSON lines",
+      "Failures of the audit log must not allow a signature to be returned without a record"
+    ],
+    "execution": "Add an `AuditLog` interface next to `AccountStore` and call it from `AccountService`. Decide and document what happens when logging fails.",
+    "tests": "Tests that every API action produces one event and that no event contains secrets. Commit: `feat(ops): add audit log`."
+  },
+  {
+    "title": "feat(ops): add an opt-in Prometheus metrics endpoint",
+    "complexity": "medium",
+    "area": "operations",
+    "description": "Operators cannot see request rates, failures or signing volume.",
+    "requirements": [
+      "`GET /metrics` in Prometheus text format, off unless `METRICS_ENABLED=true`",
+      "Counters for requests by route and status, signing requests, and auth failures",
+      "A histogram of request duration",
+      "No account addresses, emails or phone numbers in any label",
+      "Can be bound to a separate port so it is not exposed with the public API"
+    ],
+    "execution": "The `prom-client` package works well here.",
+    "tests": "Test that metrics are off by default, appear when enabled, and contain no personal data. Commit: `feat(ops): add metrics`."
+  },
+  {
+    "title": "test: add a black-box SEP-30 conformance suite",
+    "complexity": "high",
+    "area": "testing",
+    "description": "Today tests call the server in process. A separate suite that talks HTTP to any base URL would let wallet teams check any SEP-30 server, including this one.",
+    "requirements": [
+      "A command `npm run conformance -- --url https://... --sep10-token ...` that runs a series of checks",
+      "Cover all six endpoints: success paths, `400`, `401`, `404` and `409` cases from the SEP-30 text",
+      "Check that auth methods are never returned and that `authenticated` appears only on matched identities",
+      "Check that signers are listed newest first",
+      "Print a pass or fail report and exit non-zero on failure"
+    ],
+    "execution": "Read the [SEP-30 text](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0030.md) first and quote the rule each check comes from in a comment.",
+    "tests": "Run the suite against Lumenward in CI. Commit: `test: add sep-30 conformance suite`."
+  },
+  {
+    "title": "test: add a two-server recovery integration test",
+    "complexity": "high",
+    "area": "testing",
+    "description": "The core promise is that two independent servers recover an account together. No test proves it end to end.",
+    "requirements": [
+      "Start two Lumenward instances with different keys and databases (for example with `docker-compose.yml`)",
+      "On Stellar testnet, create an account, register it on both servers and add both signing keys with thresholds so neither can act alone",
+      "Run a recovery that adds a new signer using both signatures",
+      "Assert that a transaction signed by only one server is rejected by the network",
+      "Run the test in CI on demand, and document how to run it locally"
+    ],
+    "execution": "The official TypeScript wallet SDK supports SEP-30 and can be used for the client side. Check its current docs before pinning a version.",
+    "tests": "The test itself is the deliverable. Commit: `test: add two-server recovery test`."
+  },
+  {
+    "title": "feat(audit): add an audit GitHub Action",
+    "complexity": "medium",
+    "area": "auditor",
+    "description": "The recovery set auditor is a command line tool. Teams want it to run on a schedule and fail a workflow when an account is misconfigured.",
+    "requirements": [
+      "A composite or Node action in `action/` that wraps `lumenward-audit`",
+      "Inputs: `account`, `recovery-keys`, `horizon-url`",
+      "Fail the job on critical findings and print all findings in the job summary",
+      "Example workflow in the README",
+      "Document how to run it on a schedule"
+    ],
+    "execution": "Reuse `auditAccount` directly instead of spawning the CLI if you write a Node action.",
+    "tests": "Test the action logic with fixtures like `test/auditor.test.ts`. Commit: `feat(audit): add github action`."
+  },
+  {
+    "title": "feat(audit): read recovery keys from a running Lumenward server",
+    "complexity": "medium",
+    "area": "auditor",
+    "description": "Today you must copy each server's signing key by hand into `--recovery-key`. The server already returns them from `GET /accounts/<address>`.",
+    "requirements": [
+      "Add `--server <url> --server-token <jwt>` (repeatable) to `lumenward-audit`",
+      "Fetch each server's signer list for the account and use the newest key from each as the recovery key",
+      "Report if two servers return the same key (a shared-key finding)",
+      "Report servers that do not know the account",
+      "Never print tokens"
+    ],
+    "execution": "Extend `src/cli/audit.ts`. Keep the pure checks in `src/audit/auditor.ts`.",
+    "tests": "Use a local fake HTTP server in tests. Commit: `feat(audit): read keys from servers`."
+  },
+  {
+    "title": "feat(signing): add a configurable operation allow list",
+    "complexity": "medium",
+    "area": "signing",
+    "description": "Today the server signs any operation as long as the sources are allowed. A recovery server only needs a few operation types, for example `setOptions`. Limiting them reduces damage if an identity is compromised.",
+    "requirements": [
+      "New setting `ALLOWED_OPERATION_TYPES` (comma separated, for example `setOptions,bumpSequence`)",
+      "If set, a transaction with any other operation type is refused with `400`",
+      "If unset, behaviour does not change",
+      "The refusal message names the rejected type",
+      "Document the trade-offs in the README"
+    ],
+    "execution": "Extend `parseAndValidate` in `src/signing/validate.ts` and pass the policy from `src/config.ts`.",
+    "tests": "Add cases to `test/validate.test.ts` for allowed, refused and unset. Commit: `feat(signing): add operation allow list`."
+  },
+  {
+    "title": "feat(signing): add an optional time bounds requirement",
+    "complexity": "medium",
+    "area": "signing",
+    "description": "A signed transaction with no expiry can be used much later. Operators may want to require time bounds.",
+    "requirements": [
+      "New settings `REQUIRE_TIME_BOUNDS` and `MAX_TX_VALIDITY_SECONDS`",
+      "When enabled, refuse transactions with no `maxTime`, or with a `maxTime` further away than the limit",
+      "Default is off, so current behaviour does not change",
+      "Clear `400` messages",
+      "Document how wallets should set time bounds when building recovery transactions"
+    ],
+    "execution": "Time bounds are on the parsed transaction (`tx.timeBounds`). Handle the case where it is undefined.",
+    "tests": "Tests for missing, too far, and acceptable time bounds. Commit: `feat(signing): add time bounds policy`."
+  },
+  {
+    "title": "feat(auth): support muxed account SEP-10 subjects",
+    "complexity": "medium",
+    "area": "auth",
+    "description": "SEP-10 tokens may identify a muxed account (an `M...` address). `sep10Principal` accepts only `G...` addresses, so those tokens are refused.",
+    "requirements": [
+      "Check the current SEP-10 text for how muxed subjects are formatted, and link it in the pull request",
+      "Accept a muxed subject and map it to its base `G...` account",
+      "Keep refusing malformed subjects",
+      "Do not let a memo or muxed id widen access to other accounts",
+      "Document the behaviour"
+    ],
+    "execution": "The SDK can decode muxed addresses. Add the cases to `src/auth/authenticator.ts`.",
+    "tests": "Tests in a new `test/authenticator.test.ts` for `G`, `G:memo`, `M` and malformed subjects. Commit: `feat(auth): support muxed subjects`."
+  },
+  {
+    "title": "fix(security): harden HTTP defaults",
+    "complexity": "medium",
+    "area": "security",
+    "description": "The server uses Fastify defaults. A recovery server should be stricter about headers, timeouts and proxies.",
+    "requirements": [
+      "Add security headers (for example `X-Content-Type-Options`, `Cache-Control: no-store` on all account responses)",
+      "Set connection, request and keep-alive timeouts",
+      "Add a `TRUST_PROXY` setting so client IPs are right behind a load balancer, default off",
+      "Reject requests with a body on `GET` and `DELETE`",
+      "Document each setting"
+    ],
+    "execution": "Use Fastify hooks in `src/api/server.ts`. Avoid adding a large dependency for a few headers.",
+    "tests": "Tests that the headers are present and that timeouts are configured. Commit: `fix(security): harden http defaults`."
+  },
+  {
+    "title": "ci: add Dependabot and an npm audit job",
+    "complexity": "trivial",
+    "area": "operations",
+    "description": "Dependencies are not updated or checked automatically. A key-holding service should not fall behind on security fixes.",
+    "requirements": [
+      "Add `.github/dependabot.yml` for npm and GitHub Actions, weekly",
+      "Add a CI job that runs `npm audit --omit=dev --audit-level=high`",
+      "The job must not block pull requests on unrelated advisories forever: document how to handle a known false positive"
+    ],
+    "execution": "Keep the new job separate from the `test` job so branch protection on `test` is unchanged.",
+    "tests": "Show the job running in the pull request. Commit: `ci: add dependabot and audit job`."
+  },
+  {
+    "title": "docs: write an OpenAPI description of the six endpoints",
+    "complexity": "medium",
+    "area": "docs",
+    "description": "Wallet developers want a machine readable description of the API.",
+    "requirements": [
+      "`docs/openapi.yaml` (OpenAPI 3) covering all six SEP-30 endpoints and `/healthz`",
+      "Request and response bodies, status codes and the two authentication styles",
+      "A test that fails if a route in `src/api/server.ts` is missing from the file, or the reverse",
+      "Linked from the README"
+    ],
+    "execution": "Describe what the code does today and check it against the SEP-30 text.",
+    "tests": "The route-matching test is the proof. Commit: `docs: add openapi description`."
+  },
+  {
+    "title": "docs: write an operator guide for running two independent servers",
+    "complexity": "medium",
+    "area": "docs",
+    "description": "The security of SEP-30 depends on servers being run by different parties. Operators need a clear guide.",
+    "requirements": [
+      "`docs/operator-guide.md` covering configuration, key encryption key backup and restore, and upgrades",
+      "A section on why two containers you control are not independent, and what independence means in practice",
+      "How to set account thresholds and signer weights so no single server can act, with a testnet walkthrough that you have actually run",
+      "How to check the result with `lumenward-audit`",
+      "What to do if a server is lost or compromised"
+    ],
+    "execution": "Run every command you document on testnet and paste real output.",
+    "tests": "Docs only. Commit: `docs: add operator guide`."
+  },
+  {
+    "title": "docs: write a wallet integration guide",
+    "complexity": "medium",
+    "area": "docs",
+    "description": "Wallet developers need to know how to enrol an account and run a recovery against Lumenward.",
+    "requirements": [
+      "`docs/wallet-guide.md` with a worked TypeScript example: SEP-10 login, register, add signers, recover",
+      "Use the official wallet SDK where it supports the step, and say where it does not",
+      "Explain identity choices and their risks",
+      "Verify the example runs against a local Lumenward on testnet and say which SDK version you used"
+    ],
+    "execution": "Check the SDK's current documentation first, because its API changes between versions.",
+    "tests": "Docs only, but include a runnable example under `examples/`. Commit: `docs: add wallet integration guide`."
+  }
+]
